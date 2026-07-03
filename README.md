@@ -1,18 +1,17 @@
-# wickra-exchange-go
+# wickra-exchange (Go)
 
-The standalone Go module mirror of
-[`wickra-exchange`](https://github.com/wickra-lib/wickra-exchange) — streaming-native,
-unified connectivity for the ten largest crypto exchanges, with paper and replay
-simulators that share the same API.
+Go bindings for [`wickra-exchange`](https://github.com/wickra-lib/wickra-exchange)
+over the Wickra C ABI (cgo): one synchronous, pull-based API over the ten largest
+crypto exchanges, plus offline paper and replay simulators that share the same API.
 
-```bash
-go get github.com/wickra-lib/wickra-exchange-go
+```go
+ex, _ := wickraexchange.Paper(map[string]float64{"USDT": 100000}, 0, 5, 0)
+defer ex.Close()
+ex.SetPrice("BTC/USDT", 20000)
+order, _ := ex.PlaceMarket("BTC/USDT", wickraexchange.Buy, 1)
+fmt.Println(order.IsFilled())      // true
 ```
 
-This repository is a **derived artifact**: its contents are assembled and pushed
-automatically from `wickra-exchange`'s `bindings/go` by the release pipeline on
-every tagged release (the Go source, the vendored C ABI header, and the prebuilt
-native libraries under `lib/<goos>_<goarch>/`). Do not edit it by hand — open
-changes against `wickra-exchange` instead.
-
-Licensed under `MIT OR Apache-2.0`.
+The C ABI header is vendored under `include/`; the prebuilt library is staged per
+platform under `lib/<goos>_<goarch>/`. The same strategy runs **paper, replay and
+live** by swapping the constructor. Licensed under `MIT OR Apache-2.0`.
