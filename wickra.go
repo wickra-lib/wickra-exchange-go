@@ -22,6 +22,7 @@ import "C"
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"unsafe"
 )
@@ -34,6 +35,35 @@ const (
 	Buy Side = C.WICKRA_SIDE_BUY
 	// Sell side.
 	Sell Side = C.WICKRA_SIDE_SELL
+)
+
+// TimeInForce says how long an order may live.
+type TimeInForce int32
+
+// Time-in-force policies.
+const (
+	// GTC rests until cancelled. The default.
+	GTC TimeInForce = C.WICKRA_TIF_GTC
+	// IOC fills what is possible now and cancels the rest.
+	IOC TimeInForce = C.WICKRA_TIF_IOC
+	// FOK fills entirely now or not at all.
+	FOK TimeInForce = C.WICKRA_TIF_FOK
+)
+
+// SelfTradePrevention says which side to cancel when an order would match the
+// account's own resting order.
+type SelfTradePrevention int32
+
+// Self-trade-prevention policies.
+const (
+	// STPNone lets the account trade against itself. The default.
+	STPNone SelfTradePrevention = C.WICKRA_STP_NONE
+	// STPExpireMaker cancels the resting order.
+	STPExpireMaker SelfTradePrevention = C.WICKRA_STP_EXPIRE_MAKER
+	// STPExpireTaker cancels the incoming order.
+	STPExpireTaker SelfTradePrevention = C.WICKRA_STP_EXPIRE_TAKER
+	// STPExpireBoth cancels both.
+	STPExpireBoth SelfTradePrevention = C.WICKRA_STP_EXPIRE_BOTH
 )
 
 // Status is the lifecycle state of an order.
@@ -96,6 +126,9 @@ type Ticker struct {
 	Bid    float64
 	Ask    float64
 	Volume float64
+	// Timestamp is the venue's own stamp in milliseconds since the Unix epoch,
+	// or 0 when the venue published none.
+	Timestamp int64
 }
 
 // Candle is a single OHLCV bar.
@@ -161,8 +194,47 @@ func ReplayTrades(market string, tape []float64, balances map[string]float64, ma
 	return wrap(handle, "replay")
 }
 
-// Connect opens a live client for name, authenticated with API keys.
+// Market selects which of a venue's markets a client trades.
+type Market int32
+
+// The markets this binding offers. Spot is the zero value, so a zero Options
+// keeps the previous behaviour. Coin-margined and margin are deliberately
+// absent: no client routes them consistently, and Binance treats coin-margined
+// as spot outright.
+const (
+	MarketSpot        Market = C.WICKRA_MARKET_SPOT
+	MarketUSDMFutures Market = C.WICKRA_MARKET_USDM_FUTURES
+)
+
+// PositionMode is one net position per symbol, or a long and a short at once.
+// Two venues carry the margin mode on every order and four carry the position
+// side, so both have to be set before the first order rather than after it.
+type PositionMode int32
+
+const (
+	PositionOneWay PositionMode = C.WICKRA_POSITION_ONE_WAY
+	PositionHedge  PositionMode = C.WICKRA_POSITION_HEDGE
+)
+
+// Options configures a live client beyond its name and credentials. The zero
+// value is mainnet spot with cross margin in one-way mode, which is what
+// Connect used to be fixed at.
+type Options struct {
+	Testnet      bool
+	Market       Market
+	MarginMode   MarginMode
+	PositionMode PositionMode
+}
+
+// Connect opens a live client for name on the spot market, authenticated with
+// API keys. Use ConnectWith to reach a futures market or to set the margin and
+// position modes.
 func Connect(name, apiKey, apiSecret, passphrase, privateKey string, testnet bool) (*Exchange, error) {
+	return ConnectWith(name, apiKey, apiSecret, passphrase, privateKey, Options{Testnet: testnet})
+}
+
+// ConnectWith opens a live client for name with the given options.
+func ConnectWith(name, apiKey, apiSecret, passphrase, privateKey string, opts Options) (*Exchange, error) {
 	cName := C.CString(name)
 	cKey := C.CString(apiKey)
 	cSecret := C.CString(apiSecret)
@@ -178,7 +250,8 @@ func Connect(name, apiKey, apiSecret, passphrase, privateKey string, testnet boo
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet))
+	handle := C.wickra_connect(cName, cKey, cSecret, cPass, cPriv, C.bool(opts.Testnet),
+		C.int32_t(opts.Market), C.int32_t(opts.MarginMode), C.int32_t(opts.PositionMode))
 	return wrap(handle, name)
 }
 
@@ -214,6 +287,27 @@ func (e *Exchange) PlaceLimit(market string, side Side, quantity, price float64)
 	defer C.free(unsafe.Pointer(cMarket))
 	var out C.WickraOrder
 	rc := C.wickra_exchange_place_limit(e.handle, cMarket, C.int(side), C.double(quantity), C.double(price), &out)
+	if err := codeError(rc); err != nil {
+		return Order{}, err
+	}
+	return readOrder(&out), nil
+}
+
+// PlaceOrder places a full order: every field the library supports, not just a
+// market, a side, a quantity and a price.
+//
+// PlaceMarket and PlaceLimit remain as the shortest spelling of the common
+// case; this is the one that can place a stop-loss, an immediate-or-cancel, a
+// post-only or an idempotent retry.
+//
+// A field the venue cannot express refuses the order rather than weakening it,
+// which arrives here as an error rather than as a differently-shaped order
+// reaching the exchange.
+func (e *Exchange) PlaceOrder(request OrderRequest) (Order, error) {
+	cRequest, free := request.toC()
+	defer free()
+	var out C.WickraOrder
+	rc := C.wickra_exchange_place_order(e.handle, &cRequest, &out)
 	if err := codeError(rc); err != nil {
 		return Order{}, err
 	}
@@ -463,11 +557,12 @@ func readPosition(p *C.WickraPosition) Position {
 
 func readTicker(t *C.WickraTicker) Ticker {
 	return Ticker{
-		Symbol: C.GoString(&t.symbol[0]),
-		Last:   float64(t.last),
-		Bid:    float64(t.bid),
-		Ask:    float64(t.ask),
-		Volume: float64(t.volume),
+		Symbol:    C.GoString(&t.symbol[0]),
+		Last:      float64(t.last),
+		Bid:       float64(t.bid),
+		Ask:       float64(t.ask),
+		Volume:    float64(t.volume),
+		Timestamp: int64(t.timestamp),
 	}
 }
 
@@ -560,7 +655,8 @@ func ConnectDerivatives(name, apiKey, apiSecret, passphrase, privateKey string, 
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect_derivatives(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet))
+	handle := C.wickra_connect_derivatives(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet),
+		C.int32_t(MarginCross), C.int32_t(PositionOneWay))
 	if handle == nil {
 		return nil, fmt.Errorf("wickra: failed to connect derivatives client for %s", name)
 	}
@@ -670,7 +766,8 @@ func ConnectAdvanced(name, apiKey, apiSecret, passphrase, privateKey string, tes
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect_advanced(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet), C.bool(futures))
+	handle := C.wickra_connect_advanced(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet),
+		C.bool(futures), C.int32_t(MarginCross), C.int32_t(PositionOneWay))
 	if handle == nil {
 		return nil, fmt.Errorf("wickra: failed to connect advanced-orders client for %s", name)
 	}
@@ -694,13 +791,145 @@ func (a *Advanced) AmendOrder(market, orderID string, newPrice, newQuantity floa
 	return readOrder(&out), nil
 }
 
-// OrderRequest describes one order for PlaceBatch. A NaN Price places a market
-// order; a finite Price places a limit order.
+// OrderRequest describes one order.
+//
+// It used to carry four fields, which is all an order could ever be from this
+// package: a market, a side, a quantity and a price. Everything else the
+// library supports -- the trigger price that makes a stop-loss a stop-loss, the
+// time-in-force that says an order must not rest, post-only, reduce-only,
+// self-trade prevention, and the client order id that makes a retry idempotent
+// -- had no way through. The zero value of every field added since is "unset",
+// so a request written against the older shape still means what it meant.
+//
+// The order type is derived rather than named, the same way the Rust builder
+// derives it: an unset Price is a market order and a set one a limit order, and
+// a set StopPrice promotes either into its trigger form. A price of zero, or a
+// NaN, is unset -- neither is a price an exchange would accept.
 type OrderRequest struct {
-	Market   string
-	Side     Side
+	// Market is the BASE/QUOTE pair, e.g. "BTC/USDT".
+	Market string
+	// Side is Buy or Sell.
+	Side Side
+	// Quantity is the order size in base units.
 	Quantity float64
-	Price    float64
+	// Price is the limit price. Unset (zero or NaN) makes this a market order.
+	Price float64
+	// StopPrice is the trigger price the order rests for. Setting it turns a
+	// market order into a stop-market and a limit order into a stop-limit.
+	StopPrice float64
+	// TimeInForce is GTC (the zero value), IOC or FOK.
+	TimeInForce TimeInForce
+	// ClientOrderID is an id of the caller's choosing; empty means none. It is
+	// what lets a retried placement be recognised as the same order.
+	ClientOrderID string
+	// ReduceOnly makes the order close-only: it may not increase a position.
+	ReduceOnly bool
+	// PostOnly makes the order maker-only: it is cancelled rather than crossing
+	// the spread.
+	PostOnly bool
+	// STP is the self-trade-prevention policy (STPNone by the zero value).
+	STP SelfTradePrevention
+	// QuantityText is the exact quantity, used instead of Quantity when set.
+	//
+	// A float64 holds about fifteen significant digits, and the library holds
+	// every order number in an exact decimal. Sent as a float64,
+	// "12345678.90123456789" arrives as 12345678.90123457 -- a different order,
+	// placed without a word. Go has no decimal type, so the exact spelling is a
+	// string, which is what every exchange's own API takes for the same reason.
+	//
+	// Text that is not a decimal number refuses the order rather than placing
+	// one at some other number.
+	QuantityText string
+	// PriceText is the exact limit price, used instead of Price when set.
+	PriceText string
+	// StopPriceText is the exact trigger price, used instead of StopPrice when
+	// set.
+	StopPriceText string
+}
+
+// orderType derives the C order-type code from which prices are set.
+//
+// A price set only as exact text counts as set: reading the float64 alone would
+// make a limit order with an exact price into a market order, which is the
+// order that takes whatever the book offers.
+func (r OrderRequest) orderType() C.int32_t {
+	limit := isSet(r.Price) || r.PriceText != ""
+	stop := isSet(r.StopPrice) || r.StopPriceText != ""
+	switch {
+	case stop && limit:
+		return C.WICKRA_ORDER_STOP_LIMIT
+	case stop:
+		return C.WICKRA_ORDER_STOP_MARKET
+	case limit:
+		return C.WICKRA_ORDER_LIMIT
+	default:
+		return C.WICKRA_ORDER_MARKET
+	}
+}
+
+// isSet reports whether a price field carries a value. Zero and NaN both mean
+// "unset": zero because no exchange accepts it, NaN because that is how this
+// package has always spelled an absent price.
+func isSet(price float64) bool {
+	return price != 0 && !math.IsNaN(price)
+}
+
+// cPrice projects a price field onto the ABI, which reads NaN as unset.
+func cPrice(price float64) C.double {
+	if !isSet(price) {
+		return C.double(math.NaN())
+	}
+	return C.double(price)
+}
+
+// toC builds the C projection of the request. The returned function releases
+// the C strings it allocated and must be called.
+func (r OrderRequest) toC() (C.WickraOrderRequest, func()) {
+	cMarket := C.CString(r.Market)
+	var cClientID *C.char
+	if r.ClientOrderID != "" {
+		cClientID = C.CString(r.ClientOrderID)
+	}
+	// Empty stays NULL: the ABI reads the float64 beside a null pointer, so a
+	// request built without the text fields behaves exactly as it did.
+	cQuantityText := optionalCString(r.QuantityText)
+	cPriceText := optionalCString(r.PriceText)
+	cStopText := optionalCString(r.StopPriceText)
+	free := func() {
+		C.free(unsafe.Pointer(cMarket))
+		if cClientID != nil {
+			C.free(unsafe.Pointer(cClientID))
+		}
+		for _, p := range []*C.char{cQuantityText, cPriceText, cStopText} {
+			if p != nil {
+				C.free(unsafe.Pointer(p))
+			}
+		}
+	}
+	return C.WickraOrderRequest{
+		market:          cMarket,
+		side:            C.int32_t(r.Side),
+		order_type:      r.orderType(),
+		quantity:        C.double(r.Quantity),
+		price:           cPrice(r.Price),
+		stop_price:      cPrice(r.StopPrice),
+		time_in_force:   C.int32_t(r.TimeInForce),
+		client_order_id: cClientID,
+		reduce_only:     C.bool(r.ReduceOnly),
+		post_only:       C.bool(r.PostOnly),
+		stp:             C.int32_t(r.STP),
+		quantity_text:   cQuantityText,
+		price_text:      cPriceText,
+		stop_price_text: cStopText,
+	}, free
+}
+
+// optionalCString allocates a C string, or returns NULL for the empty one.
+func optionalCString(value string) *C.char {
+	if value == "" {
+		return nil
+	}
+	return C.CString(value)
 }
 
 // BatchResult is one order's outcome in a batch placement: Err is nil and Order
@@ -750,29 +979,25 @@ func (a *Advanced) PlaceBatch(requests []OrderRequest) ([]BatchResult, error) {
 	if n == 0 {
 		return nil, nil
 	}
-	markets := make([]*C.char, n)
-	sides := make([]C.int32_t, n)
-	quantities := make([]C.double, n)
-	prices := make([]C.double, n)
+	// The full ABI call, so a batched order carries the same fields a single
+	// one does. The four-array form beside it can say only market, side,
+	// quantity and price -- which is how a batch used to quietly place a
+	// different order than the caller wrote.
+	cRequests := make([]C.WickraOrderRequest, n)
+	frees := make([]func(), n)
 	for i, req := range requests {
-		markets[i] = C.CString(req.Market)
-		sides[i] = C.int32_t(req.Side)
-		quantities[i] = C.double(req.Quantity)
-		prices[i] = C.double(req.Price)
+		cRequests[i], frees[i] = req.toC()
 	}
 	defer func() {
-		for _, p := range markets {
-			C.free(unsafe.Pointer(p))
+		for _, free := range frees {
+			free()
 		}
 	}()
 	out := make([]C.WickraOrder, n)
 	outCodes := make([]C.int32_t, n)
-	rc := C.wickra_advanced_place_batch(
+	rc := C.wickra_advanced_place_batch_full(
 		a.handle,
-		(**C.char)(unsafe.Pointer(&markets[0])),
-		(*C.int32_t)(unsafe.Pointer(&sides[0])),
-		(*C.double)(unsafe.Pointer(&quantities[0])),
-		(*C.double)(unsafe.Pointer(&prices[0])),
+		&cRequests[0],
 		C.uintptr_t(n),
 		&out[0], &outCodes[0], C.uintptr_t(n))
 	if rc < 0 {
@@ -842,7 +1067,8 @@ func ConnectUserData(name, apiKey, apiSecret, passphrase, privateKey string, tes
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect_user_data(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet), C.bool(futures))
+	handle := C.wickra_connect_user_data(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet),
+		C.bool(futures), C.int32_t(MarginCross), C.int32_t(PositionOneWay))
 	if handle == nil {
 		return nil, fmt.Errorf("wickra: failed to connect user-data client for %s", name)
 	}
@@ -916,13 +1142,30 @@ func ConnectWsExecution(name, apiKey, apiSecret, passphrase, privateKey string, 
 		cPriv = C.CString(privateKey)
 		defer C.free(unsafe.Pointer(cPriv))
 	}
-	handle := C.wickra_connect_ws_execution(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet), C.bool(futures))
+	handle := C.wickra_connect_ws_execution(cName, cKey, cSecret, cPass, cPriv, C.bool(testnet),
+		C.bool(futures), C.int32_t(MarginCross), C.int32_t(PositionOneWay))
 	if handle == nil {
 		return nil, fmt.Errorf("wickra: failed to connect ws-execution client for %s", name)
 	}
 	w := &WsExecution{handle: handle}
 	runtime.SetFinalizer(w, (*WsExecution).Close)
 	return w, nil
+}
+
+// PlaceOrderWsFull places a full order over the WebSocket order API.
+//
+// The OrderRequest form of PlaceOrderWs, for the same reason: the narrow call
+// cannot carry a trigger price, a time-in-force, or any of the flags that decide
+// what the order actually is.
+func (w *WsExecution) PlaceOrderWsFull(request OrderRequest) (Order, error) {
+	cRequest, free := request.toC()
+	defer free()
+	var out C.WickraOrder
+	rc := C.wickra_ws_place_order_full(w.handle, &cRequest, &out)
+	if err := codeError(rc); err != nil {
+		return Order{}, err
+	}
+	return readOrder(&out), nil
 }
 
 // PlaceOrderWs places an order over the WebSocket order API. A NaN price places a
